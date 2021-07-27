@@ -19,15 +19,24 @@ package com.alibaba.nacos.naming.core;
 import com.alibaba.nacos.api.common.Constants;
 import com.alibaba.nacos.api.exception.NacosException;
 import com.alibaba.nacos.api.naming.utils.NamingUtils;
+import com.alibaba.nacos.common.http.HttpClientBeanHolder;
+import com.alibaba.nacos.common.http.HttpRestResult;
+import com.alibaba.nacos.common.http.client.NacosRestTemplate;
+import com.alibaba.nacos.common.http.param.Header;
+import com.alibaba.nacos.common.http.param.Query;
 import com.alibaba.nacos.common.utils.JacksonUtils;
 import com.alibaba.nacos.core.cluster.Member;
 import com.alibaba.nacos.core.cluster.ServerMemberManager;
+import com.alibaba.nacos.core.utils.ApplicationUtils;
+import com.alibaba.nacos.core.utils.BeanUtils;
+import com.alibaba.nacos.core.utils.InetUtils;
 import com.alibaba.nacos.naming.consistency.ConsistencyService;
 import com.alibaba.nacos.naming.consistency.Datum;
 import com.alibaba.nacos.naming.consistency.KeyBuilder;
 import com.alibaba.nacos.naming.consistency.RecordListener;
 import com.alibaba.nacos.naming.consistency.persistent.raft.RaftPeer;
 import com.alibaba.nacos.naming.consistency.persistent.raft.RaftPeerSet;
+import com.alibaba.nacos.naming.controllers.CatalogController;
 import com.alibaba.nacos.naming.misc.GlobalExecutor;
 import com.alibaba.nacos.naming.misc.Loggers;
 import com.alibaba.nacos.naming.misc.Message;
@@ -36,22 +45,20 @@ import com.alibaba.nacos.naming.misc.ServiceStatusSynchronizer;
 import com.alibaba.nacos.naming.misc.SwitchDomain;
 import com.alibaba.nacos.naming.misc.Synchronizer;
 import com.alibaba.nacos.naming.misc.UtilsAndCommons;
+import com.alibaba.nacos.naming.pojo.ClientInfos;
+import com.alibaba.nacos.naming.pojo.IpAppInfo;
+import com.alibaba.nacos.naming.pojo.PushClient;
+import com.alibaba.nacos.naming.pojo.ServiceAppInfo;
 import com.alibaba.nacos.naming.push.PushService;
 import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ArrayNode;
+import com.google.common.collect.Lists;
+import com.google.common.collect.Maps;
 import com.google.common.collect.Sets;
 
-import java.util.ArrayList;
-import java.util.Collection;
-import java.util.HashMap;
-import java.util.HashSet;
-import java.util.List;
-import java.util.Map;
-import java.util.Set;
-import java.util.StringJoiner;
-import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.LinkedBlockingDeque;
-import java.util.concurrent.TimeUnit;
+import java.util.*;
+import java.util.concurrent.*;
 import java.util.concurrent.locks.Lock;
 import java.util.concurrent.locks.ReentrantLock;
 import java.util.stream.Collectors;
@@ -61,6 +68,8 @@ import javax.annotation.Resource;
 
 import org.apache.commons.lang3.ArrayUtils;
 import org.apache.commons.lang3.StringUtils;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Component;
 import org.springframework.util.CollectionUtils;
@@ -73,6 +82,20 @@ import org.springframework.util.CollectionUtils;
 @Component
 public class ServiceManager implements RecordListener<Service> {
 
+    private final String PUB_DATA = "pubData";
+    private final String APP_NAME_PRE_SEPARATOR = "&appName=";
+    private final String APP_NAME_AFT_SEPARATOR = "&";
+    private final String DEFAULT_NAMESPACE = "sofamesh";
+    private final String DEFAULT_GROUPNAME = "SOFA";
+    private final String localAddress = InetUtils.getSelfIp() + ":" + ApplicationUtils.getProperty("server.port", Integer.class, 8848);
+    private static final NacosRestTemplate NACOS_REST_TEMPLATE;
+    private static final Logger LOGGER = LoggerFactory.getLogger(ServiceManager.class);
+
+    static {
+        NACOS_REST_TEMPLATE = HttpClientBeanHolder.getNacosRestTemplate(LOGGER);
+    }
+
+    private final ObjectMapper mapper = new ObjectMapper();
     /**
      * Map(namespace, Map(group@@serviceName, Service)).
      */
@@ -743,6 +766,246 @@ public class ServiceManager implements RecordListener<Service> {
         }
 
         return result;
+    }
+
+    private ClientInfoVO getClientInfo() {
+        ClientInfoVO clientInfoVO = new ClientInfoVO();
+        List<ClientInfos> clientInfos = Lists.newArrayList();
+        ConcurrentMap<String, ConcurrentMap<String, PushService.PushClient>> clientMap = pushService.getClientMap();
+        clientMap.forEach((serviceName, pubClients) -> {
+            ClientInfos infos = new ClientInfos();
+            infos.setServiceName(serviceName.split("##")[1]);
+            List<PushClient> pushClients = BeanUtils.copyList(PushClient.class, pubClients.values());
+            infos.setPushClients(Sets.newHashSet(pushClients));
+            clientInfos.add(infos);
+        });
+        clientInfoVO.setClientInfos(clientInfos);
+        return clientInfoVO;
+    }
+
+    private Map<String, Set<PushClient>> queryAllSubscribers() {
+        // 查询出所有节点
+        List<String> healthyList = Lists.newArrayList(distroMapper.getHealthyList());
+        if (org.apache.commons.collections.CollectionUtils.isEmpty(healthyList)) {
+            return Maps.newHashMap();
+        }
+        Map<String, Set<PushClient>> pubClientMap = Maps.newHashMap();
+        // 本节点的客户端信息添加到map里
+        ClientInfoVO clientInfo = getClientInfo();
+        if (org.apache.commons.collections.CollectionUtils.isNotEmpty(clientInfo.getClientInfos())) {
+            addToMap(pubClientMap, clientInfo);
+        }
+
+        addRemoteSubInfoToMap(healthyList, pubClientMap);
+        return pubClientMap;
+    }
+
+    private void addRemoteSubInfoToMap(List<String> healthyList, Map<String, Set<PushClient>> pubClientMap) {
+        // 排掉自身节点，统计其他节点的客户端值
+        healthyList.remove(localAddress);
+        List<CompletableFuture<ClientInfoVO>> futures = healthyList.stream().map(ip -> {
+            String url = "http://" + ip + "/nacos/v1/ns/catalog/subInstances";
+            // 默认ForkJoinPool，nacos的机器性能比较好，用默认的Executor就行
+            return CompletableFuture.supplyAsync(() -> {
+                try {
+                    HttpRestResult<String> result = NACOS_REST_TEMPLATE.get(url, Header.EMPTY, Query.EMPTY, String.class);
+                    return mapper.readValue(result.getData(), ClientInfoVO.class);
+                } catch (Exception e) {
+                    e.printStackTrace();
+                }
+                return null;
+            });
+        }).collect(Collectors.toList());
+        futures.stream().map(CompletableFuture::join).filter(Objects::nonNull)
+            .forEach(clientInfoVO -> addToMap(pubClientMap, clientInfoVO));
+
+    }
+
+    private void addToMap(Map<String, Set<PushClient>> pubClientMap, ClientInfoVO clientInfo) {
+        Map<String, Set<PushClient>> collect = clientInfo.getClientInfos().stream().collect(Collectors.toMap(ClientInfos::getServiceName, ClientInfos::getPushClients));
+        collect.forEach((serviceName, clients) -> {
+            Set<PushClient> pushClients = pubClientMap.get(serviceName);
+            if (org.apache.commons.collections.CollectionUtils.isEmpty(pushClients)) {
+                pushClients = Sets.newHashSet(clients);
+                pubClientMap.put(serviceName, pushClients);
+            } else {
+                pushClients.addAll(clients);
+            }
+        });
+    }
+
+    public HashMap<String, Object> getServicesList(String instanceId, int pageNo, int pageSize, String serviceName, String appName, String groupName, String namespaceId) {
+        //先把DistroFilter改造过的serviceName，还原成本来的值
+        serviceName = getServiceName(serviceName);
+        HashMap<String, Object> resultMap = new HashMap<>(16);
+        List<Map<String, Object>> resultList = new ArrayList<>(16);
+        List<Instance> allInstance = getAllInstance(namespaceId, groupName, instanceId, appName, serviceName, true);
+        //使用set去掉重复的
+        Set<ServiceAppInfo> result = new HashSet<>();
+        allInstance.forEach(instance -> result.add(new ServiceAppInfo(getServiceName(instance.getServiceName()), getAppName(instance))));
+        //分页
+        result.stream().skip((pageNo - 1) * pageSize)
+            .limit(pageSize)
+            .forEach(instance -> {
+                Map<String, Object> index = new HashMap<>(16);
+                index.put("serviceName", instance.getServiceName());
+                index.put("pubApp", instance.getAppName());
+                index.put("pubCount", getAllInstance(namespaceId, groupName, instanceId, instance.getAppName(), instance.getServiceName(), false).size());
+                index.put("subCount", getAllPushClient(namespaceId, groupName, instanceId, instance.getServiceName(), "").size());
+                resultList.add(index);
+            });
+        resultMap.put("list", resultList);
+        resultMap.put("count", result.size());
+        return resultMap;
+    }
+
+    public HashMap<String, Object> getAppsList(String clusterName, String groupName, String namespaceId) {
+        HashMap<String, Object> resultMap = new HashMap<>(16);
+        Set<String> resultList = new HashSet<>();
+        List<PushClient> pushClients = getAllPushClient(namespaceId, groupName, clusterName, "", "");
+        List<Instance> allInstance = getAllInstance(namespaceId, groupName, clusterName, "", "", false);
+        pushClients.forEach(pushClient -> {
+            resultList.add(pushClient.getApp());
+        });
+        allInstance.forEach(instance -> {
+            resultList.add(getAppName(instance));
+        });
+        resultMap.put("apps", resultList);
+        return resultMap;
+    }
+
+    public HashMap<String, Object> getServicesClientList(String instanceId, String appName, String groupName, String namespaceId) {
+        HashMap<String, Object> resultMap = new HashMap<>(16);
+        //根据clusterName,namespaceId,groupName从clientMap筛选出一批client
+        List<PushClient> collect = getAllPushClient(namespaceId, groupName, instanceId, "", appName);
+        Set<String> subServers = new HashSet<>();
+        //拿到client订阅了多少的服务
+        collect.forEach(pushClient -> subServers.add(getServiceName(pushClient.getServiceName())));
+        resultMap.put("servers", subServers);
+        return resultMap;
+    }
+
+    public HashMap<String, Object> getServicesServerList(String instanceId, String appName, String groupName, String namespaceId) {
+        HashMap<String, Object> resultMap = new HashMap<>(16);
+        List<Instance> allInstance = getAllInstance(namespaceId, groupName, instanceId, appName, "", false);
+        Set<String> serverSet = new HashSet<>();
+        allInstance.forEach(instance -> serverSet.add(getServiceName(instance.getServiceName())));
+        resultMap.put("servers", serverSet);
+        return resultMap;
+    }
+    public HashMap<String, Object> getServicesServerPubDetailList(String instanceId, String serviceName, String groupName, String namespaceId) {
+        serviceName = getServiceName(serviceName);
+        HashMap<String, Object> resultMap = new HashMap<>(16);
+        List<Instance> allInstance = getAllInstance(namespaceId, groupName, instanceId, "", serviceName, false);
+        Set<String> details = new HashSet<>();
+        allInstance.forEach(instance -> details.add(instance.getMetadata().get(PUB_DATA)));
+        resultMap.put("serviceName", serviceName);
+        resultMap.put("details", details);
+        return resultMap;
+    }
+
+    public HashMap<String, Object> getServicesServerSubDetailList(String instanceId, String serviceName, String groupName, String namespaceId) {
+        serviceName = getServiceName(serviceName);
+        HashMap<String, Object> resultMap = new HashMap<>(16);
+        List<Map<String, Object>> resultList = new ArrayList<>();
+        //根据instanceId,serviceName,groupName,namespaceId筛选一遍client
+        List<PushClient> collect = getAllPushClient(namespaceId, groupName, instanceId, serviceName, "");
+        Set<IpAppInfo> result = new HashSet<>();
+        //每一个client都要找到对应service下，所有存在的appName
+        collect.forEach(pushClient -> {
+            result.add(new IpAppInfo(pushClient.getSocketAddr().getAddress().getHostAddress(), pushClient.getApp()));
+        });
+        result.forEach(s -> {
+            Map<String, Object> index = new HashMap<>(16);
+            index.put("ip", s.getIp());
+            index.put("appName", s.getAppName());
+            resultList.add(index);
+        });
+        resultMap.put("serviceName", serviceName);
+        resultMap.put("details", resultList);
+        return resultMap;
+    }
+
+
+    public List<PushClient> getAllPushClient(String namespaceId, String groupName,
+                                             String clusterName, String serviceName, String appName) {
+        Set<PushClient> pushClientList = new HashSet<>();
+        //不传则使用默认值
+        if (StringUtils.isEmpty(namespaceId)) {
+            namespaceId = DEFAULT_NAMESPACE;
+        }
+        if (StringUtils.isEmpty(groupName)) {
+            groupName = DEFAULT_GROUPNAME;
+        }
+        //获取clientMap里的所有client实例
+        Map<String, Set<PushClient>> queryAllSubscribers = queryAllSubscribers();
+        queryAllSubscribers.values().forEach(pushClients -> {
+            pushClientList.addAll(pushClients);
+        });
+        String finalNamespaceId = namespaceId;
+        String finalGroupName = groupName;
+        List<PushClient> collect = pushClientList.stream()
+            .filter(pushClient -> pushClient.getNamespaceId().equals(finalNamespaceId)
+                && getGroupName(pushClient.getServiceName()).equals(finalGroupName)
+                && pushClient.getClusters().equals(clusterName))
+            .filter(pushClient -> StringUtils.isEmpty(serviceName) || getServiceName(pushClient.getServiceName()).equals(serviceName))
+            .filter(pushClient -> StringUtils.isEmpty(appName) || pushClient.getApp().equals(appName))
+            .collect(Collectors.toList());
+        return collect;
+    }
+
+
+    public List<Instance> getAllInstance(String namespaceId, String groupName, String clusterName,
+                                         String appName, String serviceName, boolean likely) {
+        List<Instance> instanceList = new ArrayList<>();
+        List<Cluster> clusterList = new ArrayList<>();
+        List<Service> serviceList = new ArrayList<>();
+        //不传则使用默认值
+        if (StringUtils.isEmpty(namespaceId)) {
+            namespaceId = DEFAULT_NAMESPACE;
+        }
+        if (StringUtils.isEmpty(groupName)) {
+            groupName = DEFAULT_GROUPNAME;
+        }
+        //根据namespaceId获得service
+        Map<String, Service> serviceMap = getServiceMap(namespaceId);
+        if (null == serviceMap) {
+            return new ArrayList<>();
+        }
+        //根据groupName筛选,装填serviceList
+        String finalGroupName = groupName;
+        serviceMap.keySet().stream()
+            .filter(s -> getGroupName(s).equals(finalGroupName))
+            .forEach(s -> serviceList.add(serviceMap.get(s)));
+        //根据clusterName筛选,装填clisterList
+        serviceList.forEach(service -> {
+            service.getClusterMap().keySet().stream()
+                .filter(s -> s.equals(clusterName))
+                .forEach(s -> clusterList.add(service.getClusterMap().get(s)));
+        });
+        //装填instanceList
+        clusterList.forEach(cluster -> instanceList.addAll(cluster.allIPs()));
+        //根据serviceName和AppName进行筛选
+        return instanceList.stream()
+            .filter(instance -> StringUtils.isEmpty(serviceName) || (likely ? getServiceName(instance.getServiceName()).contains(serviceName) : getServiceName(instance.getServiceName()).equals(serviceName)))
+            .filter(instance -> StringUtils.isEmpty(appName) || appName.equals(getAppName(instance)))
+            .collect(Collectors.toList());
+    }
+
+    private String getAppName(Instance instance) {
+        String pubData = instance.getMetadata().get(PUB_DATA);
+        String index = pubData.substring(pubData.indexOf(APP_NAME_PRE_SEPARATOR) + APP_NAME_PRE_SEPARATOR.length());
+        String appName = index.substring(0, index.indexOf(APP_NAME_AFT_SEPARATOR));
+        return appName;
+    }
+
+    private String getGroupName(String str) {
+        String groupName = str.split(Constants.SERVICE_INFO_SPLITER)[0];
+        return groupName;
+    }
+
+    private String getServiceName(String str) {
+        return str.split(Constants.SERVICE_INFO_SPLITER)[1];
     }
 
     public int getServiceCount() {

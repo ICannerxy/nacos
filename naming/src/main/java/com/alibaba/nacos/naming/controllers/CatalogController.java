@@ -58,7 +58,7 @@ import org.springframework.web.bind.annotation.RestController;
 
 import javax.servlet.http.HttpServletRequest;
 import java.util.*;
-import java.util.concurrent.ConcurrentMap;
+import java.util.concurrent.*;
 import java.util.stream.Collectors;
 
 /**
@@ -71,6 +71,9 @@ import java.util.stream.Collectors;
 public class CatalogController {
 
     private static final Logger LOGGER = LoggerFactory.getLogger(CatalogController.class);
+
+    private final String localAddress = InetUtils.getSelfIp() + ":" + ApplicationUtils.getProperty("server.port", Integer.class, 8848);
+
 
     @Autowired
     protected ServiceManager serviceManager;
@@ -260,7 +263,7 @@ public class CatalogController {
         }
         List<ServiceInfoModel> infoModels = Lists.newArrayList();
 
-        //
+        // 查询所有节点的客户端信息
         Map<String, Set<PushClient>> pubClientMap = queryAllSubscribers();
 
         serviceMap.values().stream().skip((pageNo - 1) * pageSize).limit(pageSize).forEach(service -> {
@@ -294,22 +297,24 @@ public class CatalogController {
     }
 
     private void addRemoteSubInfoToMap(List<String> healthyList, Map<String, Set<PushClient>> pubClientMap) {
-        Integer port = ApplicationUtils.getProperty("server.port", Integer.class, 8848);
-        String localAddress = InetUtils.getSelfIp() + ":" + port;
+        // 排掉自身节点，统计其他节点的客户端值
         healthyList.remove(localAddress);
-        for (String otherHealthyNode : healthyList) {
-            String url = "http://" + otherHealthyNode + "/nacos/v1/ns/catalog/subInstances";
-            try {
-                HttpRestResult<String> result = NACOS_REST_TEMPLATE.get(url, Header.EMPTY, Query.EMPTY, String.class);
-                ClientInfoVO clientInfoVO = mapper.readValue(result.getData(), ClientInfoVO.class);
-                if (CollectionUtils.isEmpty(clientInfoVO.getClientInfos())) {
-                    continue;
+        List<CompletableFuture<ClientInfoVO>> futures = healthyList.stream().map(ip -> {
+            String url = "http://" + ip + "/nacos/v1/ns/catalog/subInstances";
+            // 默认ForkJoinPool，nacos的机器性能比较好，用默认的Executor就行
+            return CompletableFuture.supplyAsync(() -> {
+                try {
+                    HttpRestResult<String> result = NACOS_REST_TEMPLATE.get(url, Header.EMPTY, Query.EMPTY, String.class);
+                    return mapper.readValue(result.getData(), ClientInfoVO.class);
+                } catch (Exception e) {
+                    e.printStackTrace();
                 }
-                addToMap(pubClientMap, clientInfoVO);
-            } catch (Exception e) {
-                e.printStackTrace();
-            }
-        }
+                return null;
+            });
+        }).collect(Collectors.toList());
+        futures.stream().map(CompletableFuture::join).filter(Objects::nonNull)
+            .forEach(clientInfoVO -> addToMap(pubClientMap, clientInfoVO));
+
     }
 
     private void addToMap(Map<String, Set<PushClient>> pubClientMap, ClientInfoVO clientInfo) {
