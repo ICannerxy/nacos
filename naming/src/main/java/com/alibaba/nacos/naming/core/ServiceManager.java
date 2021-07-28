@@ -1005,7 +1005,10 @@ public class ServiceManager implements RecordListener<Service> {
     }
 
     private String getServiceName(String str) {
-        return str.split(Constants.SERVICE_INFO_SPLITER)[1];
+        if (!StringUtils.isEmpty(str) && str.contains(Constants.SERVICE_INFO_SPLITER)) {
+            return str.split(Constants.SERVICE_INFO_SPLITER)[1];
+        }
+        return str;
     }
 
     public int getServiceCount() {
