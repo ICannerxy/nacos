@@ -58,6 +58,7 @@ import org.springframework.web.bind.annotation.RestController;
 
 import javax.servlet.http.HttpServletRequest;
 import java.util.*;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentMap;
 import java.util.stream.Collectors;
 
@@ -69,6 +70,8 @@ import java.util.stream.Collectors;
 @RestController
 @RequestMapping(UtilsAndCommons.NACOS_NAMING_CONTEXT + "/catalog")
 public class CatalogController {
+
+    private final String localAddress = InetUtils.getSelfIp() + ":" + ApplicationUtils.getProperty("server.port", Integer.class, 8848);
 
     private static final Logger LOGGER = LoggerFactory.getLogger(CatalogController.class);
 
@@ -84,7 +87,7 @@ public class CatalogController {
     @Autowired
     private DistroMapper distroMapper;
 
-    private static final NacosRestTemplate NACOS_REST_TEMPLATE;
+    private static NacosRestTemplate NACOS_REST_TEMPLATE;
 
     private final ObjectMapper mapper = new ObjectMapper();
 
@@ -294,22 +297,27 @@ public class CatalogController {
     }
 
     private void addRemoteSubInfoToMap(List<String> healthyList, Map<String, Set<PushClient>> pubClientMap) {
-        Integer port = ApplicationUtils.getProperty("server.port", Integer.class, 8848);
-        String localAddress = InetUtils.getSelfIp() + ":" + port;
+        // 排掉自身节点，统计其他节点的客户端值
         healthyList.remove(localAddress);
-        for (String otherHealthyNode : healthyList) {
-            String url = "http://" + otherHealthyNode + "/nacos/v1/ns/catalog/subInstances";
-            try {
-                HttpRestResult<String> result = NACOS_REST_TEMPLATE.get(url, Header.EMPTY, Query.EMPTY, String.class);
-                ClientInfoVO clientInfoVO = mapper.readValue(result.getData(), ClientInfoVO.class);
-                if (CollectionUtils.isEmpty(clientInfoVO.getClientInfos())) {
-                    continue;
+        List<CompletableFuture<ClientInfoVO>> futures = healthyList.stream().map(ip -> {
+            String url = "http://" + ip + "/nacos/v1/ns/catalog/subInstances";
+            // 默认ForkJoinPool，nacos的机器性能比较好，用默认的Executor就行
+            return CompletableFuture.supplyAsync(() -> {
+                try {
+                    HttpRestResult<String> result = NACOS_REST_TEMPLATE.get(url, Header.EMPTY, Query.EMPTY, String.class);
+                    if (null != result) {
+                        return mapper.readValue(result.getData(), ClientInfoVO.class);
+                    }
+                    return null;
+                } catch (Exception e) {
+                    e.printStackTrace();
                 }
-                addToMap(pubClientMap, clientInfoVO);
-            } catch (Exception e) {
-                e.printStackTrace();
-            }
-        }
+                return null;
+            });
+        }).collect(Collectors.toList());
+        futures.stream().map(CompletableFuture::join).filter(Objects::nonNull)
+            .forEach(clientInfoVO -> addToMap(pubClientMap, clientInfoVO));
+
     }
 
     private void addToMap(Map<String, Set<PushClient>> pubClientMap, ClientInfoVO clientInfo) {
@@ -340,23 +348,6 @@ public class CatalogController {
             subInfo.setProcessId(hostAddress + ":" + pushClient.getSocketAddr().getPort());
             subInfo.setDataId(pushClient.getServiceName().split("@@")[1]);
             subInfos.add(subInfo);
-        }
-        return subInfos;
-    }
-
-    private List<ServiceSubInfo> getSubInfos(Service service) {
-        List<ServiceSubInfo> subInfos = Lists.newArrayList();
-        List<Subscriber> clientsFuzzy = subscribeManager.getSubscribersFuzzy(service.getName(), service.getNamespaceId());
-        if (CollectionUtils.isNotEmpty(clientsFuzzy)) {
-            for (Subscriber subscriber : clientsFuzzy) {
-                ServiceSubInfo subInfo = new ServiceSubInfo();
-                subInfo.setInstanceId(subscriber.getCluster());
-                subInfo.setAppName(subscriber.getApp());
-                subInfo.setHostIp(subscriber.getIp());
-                subInfo.setProcessId(subscriber.getIp() + ":" + subscriber.getPort());
-                subInfo.setDataId(subscriber.getServiceName().split("@@")[1]);
-                subInfos.add(subInfo);
-            }
         }
         return subInfos;
     }
